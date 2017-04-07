@@ -10,16 +10,14 @@ Author URI: https://bradkovach.com
 Text Domain: tedx-events-manager
 */
 
-class EventsManagerTEDx {
+class SimpleOrm {
 
-	public function __construct() {
-
-		add_filter( 'em_booking_set_status', array( $this, 'booking_set_status' ), 10, 2 );
-		add_shortcode( 'tedx_seats', array( $this, 'current_user_seats_shortcode' ) );
-		add_action( 'wp_head', array( $this, 'wp_head' ) );
-
-	}
-
+	/**
+	 * @param $collection   mixed
+	 * @param $keepers  array   properties to keep in the collection
+	 *
+	 * @return array
+	 */
 	static function pluck( $collection, $keepers ) {
 		$result     = [];
 		$collection = (array) $collection;
@@ -32,52 +30,90 @@ class EventsManagerTEDx {
 		return $result;
 	}
 
-	static function antipluck( $collection, $keepers ) {
-		$result     = [];
-		$collection = (array) $collection;
-		foreach ( $keepers as $keeper ) {
-			if ( ! isset( $collection[ $keeper ] ) ) {
-				$result[ $keeper ] = $collection[ $keeper ];
+	/**
+	 * @param $rows array   Unstructured rows of data
+	 * @param $structure    array    Structure to impose upon the data.
+	 *
+	 * @return array
+	 */
+	static function map( $rows, $structure ) {
+
+		$rows = (array) $rows;
+		$groupedByKey = [];
+		foreach ( $structure as $entity => $properties ) {
+
+			if ( ! isset( $properties['__key'] ) ) {
+				return [];
+			}
+			$primary_key = $properties['__key'];
+
+			unset( $properties['__key'] );
+
+			$keepers  = [];
+			$children = [];
+
+			foreach ( $properties as $propertyIdx => $property ) {
+				if ( is_numeric( $propertyIdx ) ) {
+					$keepers[] = $property;
+				} else {
+					$children[ $propertyIdx ] = $property;
+				}
+			}
+
+			foreach ( $rows as $row_id => $rowObj ) {
+				$row        = (array) $rowObj;
+				$currentKey = $row[ $primary_key ];
+
+				if ( isset( $groupedByKey[ $entity ][ $currentKey ] ) ) {
+					continue;
+				}
+
+				$preparedRow = self::pluck( $row, $keepers );
+
+				$subRows = array_filter($rows, function($_row) use ($primary_key, $currentKey) {
+					return $_row->{$primary_key} === $currentKey;
+				});
+
+				foreach ( $children as $childEntity => $childProperties ) {
+					$childStructure = array(
+						$childEntity => $childProperties,
+					);
+					$preparedRow += self::map( $subRows, $childStructure );
+				}
+
+				$groupedByKey[ $entity ][ $currentKey ] = $preparedRow ;
 			}
 		}
 
-		return $result;
+		return $groupedByKey;
+	}
+}
+
+class EventsManagerTEDx {
+
+	var $messages= [];
+
+	public function __construct() {
+
+		add_filter( 'em_booking_set_status', array( $this, 'booking_set_status' ), 10, 2 );
+		add_shortcode( 'em_seats', array( $this, 'current_user_seats_shortcode' ) );
+		add_action( 'wp_head', array( $this, 'wp_head' ) );
+		add_action('init', array($this, 'maybe_update_seats') );
+
 	}
 
-	static function orm( $rows, $structure ) {
-
-		if ( ! isset( $structure['__key'] ) ) {
-			return [];
+	public function maybe_update_seats() {
+		if(
+			isset($_POST['em_seats'])
+		    && wp_verify_nonce($_POST['_wpnonce'], 'em_update_seats')
+		) {
+			foreach($_POST['em_seats'] as $seat) {
+				$this->update_seat($seat);
+			}
 		}
-
-		$result = [];
-
-		$primary_key = $structure['__key'];
-		unset( $structure['__key'] );
-
-		self::log( 'primary_key', $primary_key );
-
-
-		$rows_assoc = (array) $rows;
-
-
-//
-//		foreach ( $rows as $entity_id => &$grouped_rows ) {
-//			foreach ( $structure as $_structure_idx => &$_entity_property ) {
-//				foreach ( $grouped_rows as $_row_idx => &$row ) {
-//					if ( is_numeric( $_structure_idx ) ) {
-//						$result[ $_entity_property ] = $row[ $_entity_property ];
-//					} else {
-//						$next_structure = $_entity_property;
-//						$result[ $_structure_idx ] = self::orm( $grouped_rows, $next_structure );
-//
-//					}
-//				}
-//			}
-//		}
-
-		return $result;
 	}
+
+
 
 	public function wp_head() {
 		?>
@@ -89,6 +125,7 @@ class EventsManagerTEDx {
 			.seat {
 				padding: 1.5em;
 				border: solid 1px #ccc;
+				page-break-inside: avoid;
 			}
 
 			.seat h2 {
@@ -115,34 +152,7 @@ class EventsManagerTEDx {
 		<?php
 	}
 
-	public function booking_save( $valid, $booking ) {
-		$this->log( func_get_args() );
-
-		return $valid;
-	}
-
-	public function booking_validate( $valid, $booking ) {
-		$this->log( "validate booking", func_get_args() );
-
-		return $valid;
-	}
-
-	public function booking_delete( $valid, $booking ) {
-		$this->log( "delete booking", func_get_args() );
-
-		return $valid;
-	}
-
-	public function booking_is_pending( $valid, $booking ) {
-		$this->log( "booking_is_pending", func_get_args() );
-
-		return $valid;
-	}
-
 	public function booking_set_status( $old_status, $booking ) {
-		$this->log( "Entering booking set status" );
-
-		$this->log( $old_status, $booking->booking_status );
 		/*
 		 * 		$this->status_array = array(
 			0 => __('Pending','events-manager'),
@@ -165,10 +175,44 @@ class EventsManagerTEDx {
 		}
 	}
 
+	public function update_seat( $seat ) {
+		global $wpdb;
+		$user = wp_get_current_user();
+
+		if( !($user instanceof WP_User) )
+			die('Unable to update seat');
+
+		if( !is_email($seat['email']) ) {
+			$this->messages[] = __("Please enter valid email addresses", 'em_seats');
+			return false;
+		}
+
+		$query = $wpdb->prepare(
+			"
+			UPDATE `" . $wpdb->prefix . "em_seats` Seat
+			JOIN `" . $wpdb->prefix . "em_bookings` Booking on Seat.booking_id = Booking.booking_id
+			JOIN `" . $wpdb->prefix . "users` User on Booking.person_id = User.id
+			SET 
+				Seat.first_name = %s,
+				Seat.last_name = %s,
+				Seat.email = %s
+			WHERE User.id = %d
+			AND Seat.seat_id = %d
+			",
+			$seat['first_name'],
+			$seat['last_name'],
+			$seat['email'],
+			$user->ID,
+			$seat['seat_id']
+		);
+
+		return $wpdb->query($query);
+	}
+
 	public function create_seats( $booking ) {
 		global $wpdb;
 
-		$query_header = sprintf( "INSERT INTO %stedx_event_seats (booking_id, seat_locator, first_name, last_name, email)", $wpdb->prefix );
+		$query_header = sprintf( "INSERT INTO %sem_seats (booking_id, seat_locator, first_name, last_name, email)", $wpdb->prefix );
 		$query_rows   = array();
 
 		for ( $i = 0; $i < $booking->booking_spaces; $i ++ ) {
@@ -187,7 +231,7 @@ class EventsManagerTEDx {
 
 	public function delete_seats( $booking ) {
 		global $wpdb;
-		$wpdb->delete( $wpdb->prefix . 'tedx_event_seats', array(
+		$wpdb->delete( $wpdb->prefix . 'em_seats', array(
 			'booking_id' => $booking->booking_id,
 		) );
 	}
@@ -201,62 +245,71 @@ FROM `$wpdb->prefix" . "users` User
 INNER JOIN `$wpdb->prefix" . "em_bookings` Booking on User.id = Booking.person_id
 INNER JOIN `$wpdb->prefix" . "em_tickets_bookings` BookingsTickets on Booking.booking_id = BookingsTickets.booking_id
 INNER JOIN `$wpdb->prefix" . "em_tickets` Ticket on BookingsTickets.ticket_id = Ticket.ticket_id
-INNER JOIN `$wpdb->prefix" . "tedx_event_seats` Seat on Booking.booking_id = Seat.booking_id
+INNER JOIN `$wpdb->prefix" . "em_seats` Seat on Booking.booking_id = Seat.booking_id
 INNER JOIN `$wpdb->prefix" . "em_events` Event on Ticket.event_id = Event.event_id
 WHERE User.ID = %d", $current_user->ID );
 
 		$user_view_query = $wpdb->prepare( "SELECT Ticket.*, Seat.*, Event.*, BookUser.*
 FROM `$wpdb->prefix" . "users` User
-INNER JOIN `$wpdb->prefix" . "tedx_event_seats` Seat on User.user_email = Seat.email
+INNER JOIN `$wpdb->prefix" . "em_seats` Seat on User.user_email = Seat.email
 INNER JOIN `$wpdb->prefix" . "em_bookings` Booking on Seat.booking_id = Booking.booking_id
 INNER JOIN `$wpdb->prefix" . "users` BookUser on Booking.person_id = BookUser.ID
-INNER JOIN `$wpdb->prefix" . "em_tickets_bookings`TB on Booking.booking_id = TB.booking_id
+INNER JOIN `$wpdb->prefix" . "em_tickets_bookings` TB on Booking.booking_id = TB.booking_id
 INNER JOIN `$wpdb->prefix" . "em_tickets` Ticket on TB.ticket_id = Ticket.ticket_id
 INNER JOIN `$wpdb->prefix" . "em_events` Event on Ticket.event_id = Event.event_id
 WHERE User.ID = %d", $current_user->ID );
 
 
-		$this->log( 'user owns query', $user_owns_query );
-
-
 		$user_edit = $wpdb->get_results( $user_owns_query );
 
-		$_user_edit = $this->orm( $user_edit, array(
-			'__key'  => 'event_id',
-			'event_id',
-			'event_slug',
-			'event_owner',
-			'event_status',
-			'event_name',
-			'event_start_time',
-			'event_end_time',
-			'event_all_day',
-			'event_start_date',
-			'event_end_date',
-			'post_content',
-			'event_rsvp',
-			'event_rsvp_date',
-			'event_rsvp_time',
-			'event_rsvp_spaces',
-			'event_spaces',
-			'event_private',
-			'Ticket' => array(
-				'__key' => 'ticket_id',
-				'ticket_id',
-				'ticket_name',
-				'ticket_description',
-				'Seats' => array(
-					'__key' => 'seat_id',
-					'seat_id',
-					'seat_locator',
-					'first_name',
-					'last_name',
-					'email',
-				),
+		$structure = array(
+			'Events' => array(
+				'__key'   => 'event_id',
+				'event_id',
+				'event_slug',
+				'event_owner',
+				'event_status',
+				'event_name',
+				'event_start_time',
+				'event_end_time',
+				'event_all_day',
+				'event_start_date',
+				'event_end_date',
+				'post_content',
+				'event_rsvp',
+				'event_rsvp_date',
+				'event_rsvp_time',
+				'event_rsvp_spaces',
+				'event_spaces',
+				'event_private',
+				'Tickets' => array(
+					'__key'    => 'ticket_id',
+					'ticket_id',
+					'ticket_name',
+					'ticket_description',
+					'Bookings' => array(
+						'__key' => 'booking_id',
+						'booking_id',
+						'booking_date',
+						'booking_status',
+						'booking_spaces',
+						'Seats' => array(
+							'__key' => 'seat_id',
+							'seat_id',
+							'seat_locator',
+							'first_name',
+							'last_name',
+							'email',
+						),
+					),
 
+				),
 			),
-		) );
-		$user_view  = $wpdb->get_results( $user_view_query );
+		);
+
+		$_user_edit = SimpleOrm::map( $user_edit, $structure );
+
+		$user_view = $wpdb->get_results( $user_view_query );
 
 
 		require 'my_seats.php';
@@ -301,9 +354,15 @@ WHERE User.ID = %d", $current_user->ID );
 
 	static function install() {
 		global $wpdb;
-		self::log( "Installing TEDx Events Manager add ons" );
 
-		$query = "CREATE TABLE IF NOT EXISTS `" . $wpdb->prefix . "tedx_event_seats` (" . "`seat_id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, " . "booking_id INT NOT NULL, " . "seat_locator CHAR(64) NOT NULL, " . "first_name VARCHAR(50) NOT NULL, " . "last_name VARCHAR(50) NOT NULL, " . "email VARCHAR(255) NOT NULL " . ")";
+		$query = "CREATE TABLE IF NOT EXISTS `" . $wpdb->prefix . "em_seats` ("
+		         . "`seat_id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+		         . "booking_id INT NOT NULL, "
+		         . "seat_locator CHAR(64) NOT NULL, "
+		         . "first_name VARCHAR(50) NOT NULL, "
+		         . "last_name VARCHAR(50) NOT NULL, "
+		         . "email VARCHAR(255) NOT NULL "
+		         . ")";
 
 		$wpdb->query( $query );
 
