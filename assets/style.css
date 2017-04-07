@@ -1,0 +1,30 @@
+.seats > .seat + .seat {
+    margin-top: 1.5em;
+}
+
+.seat {
+    padding: 1.5em;
+    border: solid 1px #ccc;
+    page-break-inside: avoid;
+}
+
+.seat h2 {
+    font-weight: normal;
+    margin: 0;
+    padding: 0;
+}
+
+.seat * {
+    margin: 0;
+    padding: 0;
+
+}
+
+.seat > * + * {
+    margin-top: 1.5em;
+}
+
+.seat .right {
+    float: left;
+
+}
